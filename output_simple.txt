@@ -1,0 +1,6 @@
+world	1
+framework	1
+java	1
+mapreduce	2
+again	1
+hello	3

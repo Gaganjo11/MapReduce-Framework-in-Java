@@ -1,0 +1,171 @@
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+public class Job {
+    private final Configuration conf;
+    private String inputPath;
+    private String outputDir;
+    private Class<? extends Mapper> mapperClass;
+    private Class<? extends Reducer> reducerClass;
+    private Partitioner partitioner = new DefaultPartitioner<>();
+    private int numReduceTasks = 2;
+    private int maxRetries = 3;
+
+    public Job(Configuration conf) {
+        this.conf = conf;
+    }
+
+    public static Job getInstance(Configuration conf) {
+        return new Job(conf);
+    }
+
+    public void setInputPath(String path) { this.inputPath = path; }
+    public void setOutputDir(String dir) { this.outputDir = dir; }
+    public void setMapperClass(Class<? extends Mapper> cls) { this.mapperClass = cls; }
+    public void setReducerClass(Class<? extends Reducer> cls) { this.reducerClass = cls; }
+    public void setPartitioner(Partitioner partitioner) { this.partitioner = partitioner; }
+    public void setNumReduceTasks(int tasks) { this.numReduceTasks = tasks; }
+    public void setMaxRetries(int retries) { this.maxRetries = retries; }
+
+    public boolean waitForCompletion(boolean verbose) throws Exception {
+        List<InputSplit> splits = createSplits(new File(inputPath));
+        if (verbose) System.out.println("Created " + splits.size() + " splits");
+
+        List<Context> mapContexts = runMapPhase(splits, verbose);
+        if (mapContexts == null) return false;
+
+        Map<Object, List<Object>> grouped = shuffleAndSort(mapContexts);
+        if (verbose) System.out.println("Shuffled into " + grouped.size() + " unique keys");
+
+        boolean success = runReducePhase(grouped, verbose);
+        if (!success) return false;
+
+        System.out.println("Job completed successfully. Output written to " + outputDir);
+        return true;
+    }
+
+    private List<InputSplit> createSplits(File file) throws IOException {
+        long fileSize = file.length();
+        long splitSize = Math.max(1024 * 1024, fileSize / 4);
+        List<InputSplit> splits = new ArrayList<>();
+        long start = 0;
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            while (start < fileSize) {
+                long end = Math.min(start + splitSize, fileSize);
+                if (end < fileSize) {
+                    raf.seek(end);
+                    raf.readLine();
+                    end = raf.getFilePointer();
+                }
+                splits.add(new InputSplit(file.getAbsolutePath(), start, end - start));
+                start = end;
+            }
+        }
+        return splits;
+    }
+
+    private List<Context> runMapPhase(List<InputSplit> splits, boolean verbose) {
+        ExecutorService executor = Executors.newFixedThreadPool(splits.size());
+        List<Future<Context>> futures = new ArrayList<>();
+        for (InputSplit split : splits) {
+            futures.add(executor.submit(() -> {
+                Exception lastException = null;
+                for (int attempt = 1; attempt <= maxRetries; attempt++) {
+                    try {
+                        Context ctx = new Context(conf);
+                        Mapper mapper = mapperClass.getDeclaredConstructor().newInstance();
+                        try (RecordReader reader = split.createRecordReader()) {
+                            while (reader.nextKeyValue()) {
+                                mapper.map(reader.getCurrentKey(), reader.getCurrentValue(), ctx);
+                            }
+                        }
+                        return ctx;
+                    } catch (Exception e) {
+                        lastException = e;
+                        if (verbose) System.err.println("Map attempt " + attempt + " failed: " + e.getMessage());
+                        if (attempt == maxRetries) break;
+                        Thread.sleep(1000 * attempt);
+                    }
+                }
+                throw new RuntimeException("Map task failed after " + maxRetries + " attempts", lastException);
+            }));
+        }
+        executor.shutdown();
+        List<Context> contexts = new ArrayList<>();
+        try {
+            for (Future<Context> future : futures) {
+                contexts.add(future.get());
+            }
+        } catch (Exception e) {
+            System.err.println("Map phase failed: " + e.getMessage());
+            return null;
+        }
+        return contexts;
+    }
+
+    private Map<Object, List<Object>> shuffleAndSort(List<Context> contexts) {
+        Map<Object, List<Object>> grouped = new HashMap<>();
+        for (Context ctx : contexts) {
+            for (Pair<Object, Object> pair : ctx.getOutputs()) {
+                grouped.computeIfAbsent(pair.getKey(), k -> new ArrayList<>())
+                       .add(pair.getValue());
+            }
+        }
+        return new TreeMap<>(grouped);
+    }
+
+    private boolean runReducePhase(Map<Object, List<Object>> grouped, boolean verbose) {
+        List<List<Map.Entry<Object, List<Object>>>> partitions = new ArrayList<>(numReduceTasks);
+        for (int i = 0; i < numReduceTasks; i++) partitions.add(new ArrayList<>());
+
+        for (Map.Entry<Object, List<Object>> entry : grouped.entrySet()) {
+            int partition = partitioner.getPartition(entry.getKey(), numReduceTasks);
+            partitions.get(partition).add(entry);
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(numReduceTasks);
+        List<Future<Boolean>> futures = new ArrayList<>();
+        for (int i = 0; i < numReduceTasks; i++) {
+            final int reducerId = i;
+            final List<Map.Entry<Object, List<Object>>> keysForReducer = partitions.get(i);
+            futures.add(executor.submit(() -> {
+                Exception lastException = null;
+                for (int attempt = 1; attempt <= maxRetries; attempt++) {
+                    try {
+                        Context reduceCtx = new Context(conf);
+                        Reducer reducer = reducerClass.getDeclaredConstructor().newInstance();
+                        for (Map.Entry<Object, List<Object>> entry : keysForReducer) {
+                            reducer.reduce(entry.getKey(), entry.getValue(), reduceCtx);
+                        }
+                        String partFile = outputDir + "/part-r-" + String.format("%05d", reducerId);
+                        try (BufferedWriter writer = new BufferedWriter(new FileWriter(partFile))) {
+                            for (Pair<Object, Object> pair : reduceCtx.getOutputs()) {
+                                writer.write(pair.getKey() + "\t" + pair.getValue());
+                                writer.newLine();
+                            }
+                        }
+                        return true;
+                    } catch (Exception e) {
+                        lastException = e;
+                        if (verbose) System.err.println("Reduce attempt " + attempt + " failed: " + e.getMessage());
+                        if (attempt == maxRetries) break;
+                        Thread.sleep(1000 * attempt);
+                    }
+                }
+                throw new RuntimeException("Reduce task failed after " + maxRetries + " attempts", lastException);
+            }));
+        }
+        executor.shutdown();
+        try {
+            for (Future<Boolean> future : futures) {
+                if (!future.get()) return false;
+            }
+        } catch (Exception e) {
+            System.err.println("Reduce phase failed: " + e.getMessage());
+            return false;
+        }
+        return true;
+    }
+}

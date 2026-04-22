@@ -1,0 +1,4 @@
+hello world
+hello mapreduce
+framework mapreduce java
+hello again
