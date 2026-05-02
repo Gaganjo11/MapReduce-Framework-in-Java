@@ -17,3 +17,6 @@ java WordCountDriver input.txt mapreduce_output
 cat mapreduce_output/result-0   # Results from reducer 0
 cat mapreduce_output/result-1   # Results from reducer 1
 cat mapreduce_output/result-2   # Results from reducer 2
+
+# 7. Note
+Java version must be 21 between 25
